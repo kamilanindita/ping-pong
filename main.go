@@ -2,36 +2,82 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 )
 
-// main adalah fungsi utama yang akan dieksekusi.
-func main() {
-	// Mendaftarkan handler untuk endpoint "/ping".
-	// Setiap request ke "/ping" akan ditangani oleh fungsi ini.
-	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		// Mengatur header Content-Type agar klien tahu bahwa responsnya adalah JSON.
-		w.Header().Set("Content-Type", "application/json")
+// RequestBody defines the structure for the incoming JSON request
+type RequestBody struct {
+	Price        float64 `json:"price"`
+	UserCategory string  `json:"user_category"`
+}
 
-		// Membuat data respons dalam bentuk map.
-		response := map[string]string{"message": "pong"}
+// ResponseBody defines the structure for the JSON response
+type ResponseBody struct {
+	OriginalPrice float64 `json:"original_price"`
+	Discount      float64 `json:"discount"`
+	FinalPrice    float64 `json:"final_price"`
+}
 
-		// Meng-encode map menjadi format JSON dan mengirimkannya sebagai respons.
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			// Jika terjadi error saat encoding JSON, catat error dan kirim status 500.
-			log.Printf("Error encoding JSON response: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
-	})
-
-	// Memberi tahu di console bahwa server akan dimulai.
-	log.Println("Server Go berjalan di http://localhost:8080")
-
-	// Memulai server HTTP di port 8080.
-	// Jika server gagal dimulai, program akan berhenti dengan pesan error.
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Tidak dapat memulai server: %s\n", err)
+// calculateDiscount is our pure business logic function.
+// It's easy to test this function on its own (unit test).
+func calculateDiscount(price float64, category string) (float64, float64) {
+	var discountRate float64
+	switch category {
+	case "premium":
+		discountRate = 0.20 // 20% discount
+	case "gold":
+		discountRate = 0.10 // 10% discount
+	default:
+		discountRate = 0.0 // 0% discount
 	}
+
+	discountAmount := price * discountRate
+	finalPrice := price - discountAmount
+	return discountAmount, finalPrice
+}
+
+// discountHandler is the HTTP handler we want to test.
+func discountHandler(w http.ResponseWriter, r *http.Request) {
+	var reqBody RequestBody
+
+	// Decode the request body
+	err := json.NewDecoder(r.Body).Decode(&reqBody)
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate input
+	if reqBody.Price <= 0 {
+		http.Error(w, "Price must be positive", http.StatusBadRequest)
+		return
+	}
+
+	// Use the business logic
+	discount, finalPrice := calculateDiscount(reqBody.Price, reqBody.UserCategory)
+
+	// Prepare the response
+	resBody := ResponseBody{
+		OriginalPrice: reqBody.Price,
+		Discount:      discount,
+		FinalPrice:    finalPrice,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resBody)
+}
+
+// pingHandler is a simple handler for health checks.
+func pingHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("pong"))
+}
+
+func main() {
+	http.HandleFunc("/ping", pingHandler)
+	http.HandleFunc("/calculate-discount", discountHandler)
+	// For testing, we don't need to start the server.
+	// But to run it for k6, we must start it.
+	http.ListenAndServe(":8080", nil)
 }
