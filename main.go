@@ -1,127 +1,158 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 )
 
-// --- Tipe Data ---
-type Transaction struct {
-	ID        int
-	ProductID string
-	Region    string
-	Amount    float64
-}
+var db *sql.DB
 
-type RegionalSummary struct {
-	TotalSales float64 `json:"total_sales"`
-	NumTrans   int     `json:"number_of_transactions"`
-}
-
-type SalesReport struct {
-	RegionalSales map[string]RegionalSummary `json:"regional_sales"`
-}
-
-// --- Interfaces untuk Dependensi ---
-type TransactionFetcher interface {
-	FetchTransactions(recordCount int) ([]Transaction, error)
-}
-
-type ReportAggregator interface {
-	AggregateByRegion(transactions []Transaction) SalesReport
-}
-
-// --- Implementasi NYATA (untuk produksi) ---
-type LiveTransactionFetcher struct{}
-
-// Fungsi inilah yang menjadi sumber utama penggunaan memori.
-func (f *LiveTransactionFetcher) FetchTransactions(recordCount int) ([]Transaction, error) {
-	log.Printf("NYATA: Mengalokasikan memori untuk %d data transaksi...", recordCount)
-	if recordCount > 100000 {
-		return nil, errors.New("permintaan data terlalu besar")
-	}
-
-	// Alokasikan slice besar di memori.
-	transactions := make([]Transaction, recordCount)
-	regions := []string{"Asia", "Europe", "North America", "South America", "Africa"}
-
-	// Isi slice dengan data dummy.
-	for i := 0; i < recordCount; i++ {
-		transactions[i] = Transaction{
-			ID:        i,
-			ProductID: fmt.Sprintf("PROD-%d", rand.Intn(1000)),
-			Region:    regions[rand.Intn(len(regions))],
-			Amount:    rand.Float64() * 500,
-		}
-	}
-	log.Printf("NYATA: Selesai membuat %d data transaksi di memori.", recordCount)
-	return transactions, nil
-}
-
-type LiveReportAggregator struct{}
-
-// Fungsi ini juga menggunakan memori untuk membuat map agregasi.
-func (a *LiveReportAggregator) AggregateByRegion(transactions []Transaction) SalesReport {
-	log.Println("NYATA: Memulai agregasi data...")
-	summary := make(map[string]RegionalSummary)
-
-	for _, tx := range transactions {
-		regionData := summary[tx.Region]
-		regionData.TotalSales += tx.Amount
-		regionData.NumTrans++
-		summary[tx.Region] = regionData
-	}
-
-	log.Println("NYATA: Selesai melakukan agregasi.")
-	return SalesReport{RegionalSales: summary}
-}
-
-// --- Handler Utama ---
-type ReportHandler struct {
-	fetcher    TransactionFetcher
-	aggregator ReportAggregator
-}
-
-func NewReportHandler(f TransactionFetcher, a ReportAggregator) *ReportHandler {
-	return &ReportHandler{f, a}
-}
-
-func (h *ReportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var reqData struct {
-		RecordCount int `json:"record_count"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// 1. Fetch (Memory Allocation)
-	transactions, err := h.fetcher.FetchTransactions(reqData.RecordCount)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// 2. Aggregate (Memory Processing)
-	report := h.aggregator.AggregateByRegion(transactions)
-
-	// 3. Respond
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(report)
+type Product struct {
+	ID    int     `json:"id"`
+	Name  string  `json:"name"`
+	Price float64 `json:"price"`
+	Stock int     `json:"stock"`
 }
 
 func main() {
-	handler := NewReportHandler(
-		&LiveTransactionFetcher{},
-		&LiveReportAggregator{},
-	)
-	mux := http.NewServeMux()
-	mux.Handle("/generate-sales-report", handler)
+	// --- Koneksi & Migrasi Database ---
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		log.Fatal("DATABASE_URL tidak disetel")
+	}
 
-	log.Println("Server pelaporan penjualan berjalan di http://localhost:8080")
-	http.ListenAndServe(":8080", mux)
+	runMigrations(connStr)
+	initDB(connStr)
+	defer db.Close()
+
+	// --- Pengaturan Router & Server ---
+	r := mux.NewRouter()
+	r.HandleFunc("/products", createProductHandler).Methods("POST")
+	r.HandleFunc("/products/{id}", getProductHandler).Methods("GET")
+	r.HandleFunc("/products/{id}/stock", updateStockHandler).Methods("PUT")
+
+	log.Println("Server berjalan di http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", r))
+}
+
+func runMigrations(databaseURL string) {
+	log.Println("Menjalankan migrasi database...")
+	// Path ke file migrasi di dalam kontainer Docker
+	migrationsPath := "file://db/migration"
+
+	m, err := migrate.New(migrationsPath, databaseURL)
+	if err != nil {
+		log.Fatalf("Gagal membuat instance migrasi: %v", err)
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		log.Fatalf("Gagal menjalankan migrasi 'up': %v", err)
+	}
+
+	log.Println("Migrasi database berhasil dijalankan.")
+}
+
+func initDB(connStr string) {
+	var err error
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("Gagal membuka koneksi database: %v", err)
+	}
+
+	// Coba terhubung ke DB dengan retry logic, penting untuk Docker Compose
+	for i := 0; i < 5; i++ {
+		err = db.Ping()
+		if err == nil {
+			log.Println("Berhasil terhubung ke database.")
+			return
+		}
+		log.Printf("Gagal ping database, mencoba lagi dalam 2 detik... (%v)", err)
+		time.Sleep(2 * time.Second)
+	}
+	log.Fatalf("Tidak dapat terhubung ke database setelah beberapa kali percobaan: %v", err)
+}
+
+// Handler untuk MENULIS produk baru
+func createProductHandler(w http.ResponseWriter, r *http.Request) {
+	var p Product
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	sqlStatement := `INSERT INTO products (name, price, stock) VALUES ($1, $2, $3) RETURNING id`
+	err := db.QueryRow(sqlStatement, p.Name, p.Price, p.Stock).Scan(&p.ID)
+	if err != nil {
+		http.Error(w, "Gagal membuat produk", http.StatusInternalServerError)
+		log.Printf("Error QueryRow: %v", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(p)
+}
+
+// Handler untuk MEMBACA produk
+func getProductHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, _ := strconv.Atoi(vars["id"])
+
+	var p Product
+	sqlStatement := `SELECT id, name, price, stock FROM products WHERE id=$1`
+	err := db.QueryRow(sqlStatement, id).Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, "Gagal mengambil produk", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+// Handler untuk MEMPERBARUI stok
+func updateStockHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, _ := strconv.Atoi(vars["id"])
+
+	var payload struct {
+		Stock int `json:"stock"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	sqlStatement := `UPDATE products SET stock = $1 WHERE id = $2`
+	res, err := db.Exec(sqlStatement, payload.Stock, id)
+	if err != nil {
+		http.Error(w, "Gagal memperbarui stok", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "Stok berhasil diperbarui")
 }
