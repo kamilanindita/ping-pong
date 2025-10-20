@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -164,4 +165,3 @@ func main() {
 	log.Println("Server agregator perjalanan berjalan di http://localhost:8080")
 	http.ListenAndServe(":8080", mux)
 }
-
