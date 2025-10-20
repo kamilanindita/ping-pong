@@ -5,163 +5,123 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
-	"sync"
-	"time"
 )
 
-// --- Tipe Data untuk Hasil ---
-type FlightDeal struct {
-	Airline string  `json:"airline"`
-	Price   float64 `json:"price"`
+// --- Tipe Data ---
+type Transaction struct {
+	ID        int
+	ProductID string
+	Region    string
+	Amount    float64
 }
 
-type HotelDeal struct {
-	HotelName string  `json:"hotel_name"`
-	Price     float64 `json:"price_per_night"`
+type RegionalSummary struct {
+	TotalSales float64 `json:"total_sales"`
+	NumTrans   int     `json:"number_of_transactions"`
 }
 
-type ActivityDeal struct {
-	Name        string  `json:"name"`
-	Price       float64 `json:"price_per_person"`
-	Description string  `json:"description"`
+type SalesReport struct {
+	RegionalSales map[string]RegionalSummary `json:"regional_sales"`
 }
 
-// --- Interfaces untuk Dependensi Eksternal ---
-type FlightFinder interface {
-	FindFlights(destination string) ([]FlightDeal, error)
+// --- Interfaces untuk Dependensi ---
+type TransactionFetcher interface {
+	FetchTransactions(recordCount int) ([]Transaction, error)
 }
-type HotelFinder interface {
-	FindHotels(destination string) ([]HotelDeal, error)
-}
-type ActivityFinder interface {
-	FindActivities(destination string) ([]ActivityDeal, error)
+
+type ReportAggregator interface {
+	AggregateByRegion(transactions []Transaction) SalesReport
 }
 
 // --- Implementasi NYATA (untuk produksi) ---
-type LiveFlightFinder struct{}
+type LiveTransactionFetcher struct{}
 
-func (f *LiveFlightFinder) FindFlights(destination string) ([]FlightDeal, error) {
-	log.Println("NYATA: Mencari penerbangan...")
-	time.Sleep(150 * time.Millisecond) // Simulasikan latensi jaringan
-	if destination == "Tokyo" {
-		return []FlightDeal{{Airline: "JAL", Price: 1200.50}, {Airline: "ANA", Price: 1250.00}}, nil
+// Fungsi inilah yang menjadi sumber utama penggunaan memori.
+func (f *LiveTransactionFetcher) FetchTransactions(recordCount int) ([]Transaction, error) {
+	log.Printf("NYATA: Mengalokasikan memori untuk %d data transaksi...", recordCount)
+	if recordCount > 100000 {
+		return nil, errors.New("permintaan data terlalu besar")
 	}
-	if destination == "Bali" {
-		return nil, errors.New("tidak ada penerbangan tersedia untuk Bali")
+
+	// Alokasikan slice besar di memori.
+	transactions := make([]Transaction, recordCount)
+	regions := []string{"Asia", "Europe", "North America", "South America", "Africa"}
+
+	// Isi slice dengan data dummy.
+	for i := 0; i < recordCount; i++ {
+		transactions[i] = Transaction{
+			ID:        i,
+			ProductID: fmt.Sprintf("PROD-%d", rand.Intn(1000)),
+			Region:    regions[rand.Intn(len(regions))],
+			Amount:    rand.Float64() * 500,
+		}
 	}
-	return []FlightDeal{{Airline: "Generic Air", Price: 800.00}}, nil
+	log.Printf("NYATA: Selesai membuat %d data transaksi di memori.", recordCount)
+	return transactions, nil
 }
 
-type LiveHotelFinder struct{}
+type LiveReportAggregator struct{}
 
-func (f *LiveHotelFinder) FindHotels(destination string) ([]HotelDeal, error) {
-	log.Println("NYATA: Mencari hotel...")
-	time.Sleep(200 * time.Millisecond) // Simulasikan latensi yang sedikit lebih lama
-	if destination == "Paris" {
-		return []HotelDeal{{HotelName: "Ritz", Price: 990.00}}, nil
+// Fungsi ini juga menggunakan memori untuk membuat map agregasi.
+func (a *LiveReportAggregator) AggregateByRegion(transactions []Transaction) SalesReport {
+	log.Println("NYATA: Memulai agregasi data...")
+	summary := make(map[string]RegionalSummary)
+
+	for _, tx := range transactions {
+		regionData := summary[tx.Region]
+		regionData.TotalSales += tx.Amount
+		regionData.NumTrans++
+		summary[tx.Region] = regionData
 	}
-	return []HotelDeal{{HotelName: "Grand Hyatt", Price: 350.75}}, nil
+
+	log.Println("NYATA: Selesai melakukan agregasi.")
+	return SalesReport{RegionalSales: summary}
 }
 
-type LiveActivityFinder struct{}
-
-func (f *LiveActivityFinder) FindActivities(destination string) ([]ActivityDeal, error) {
-	log.Println("NYATA: Mencari aktivitas...")
-	time.Sleep(100 * time.Millisecond)
-	if destination == "Paris" {
-		return nil, errors.New("layanan aktivitas sedang down")
-	}
-	return []ActivityDeal{{Name: "City Tour", Price: 75.00, Description: "Jelajahi kota"}}, nil
+// --- Handler Utama ---
+type ReportHandler struct {
+	fetcher    TransactionFetcher
+	aggregator ReportAggregator
 }
 
-// --- Handler Utama yang Mengatur Alur Kerja ---
-type ItineraryHandler struct {
-	flightSvc   FlightFinder
-	hotelSvc    HotelFinder
-	activitySvc ActivityFinder
+func NewReportHandler(f TransactionFetcher, a ReportAggregator) *ReportHandler {
+	return &ReportHandler{f, a}
 }
 
-func NewItineraryHandler(f FlightFinder, h HotelFinder, a ActivityFinder) *ItineraryHandler {
-	return &ItineraryHandler{f, h, a}
-}
-
-type ItineraryResponse struct {
-	Flights    []FlightDeal   `json:"flights,omitempty"`
-	Hotels     []HotelDeal    `json:"hotels,omitempty"`
-	Activities []ActivityDeal `json:"activities,omitempty"`
-	Errors     []string       `json:"errors,omitempty"`
-}
-
-func (h *ItineraryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *ReportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var reqData struct {
-		Destination string `json:"destination"`
+		RecordCount int `json:"record_count"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	response := ItineraryResponse{}
-	var wg sync.WaitGroup
-	var mu sync.Mutex // Untuk melindungi akses ke 'response'
+	// 1. Fetch (Memory Allocation)
+	transactions, err := h.fetcher.FetchTransactions(reqData.RecordCount)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-	// 1. Jalankan semua pencarian secara paralel
-	wg.Add(3)
+	// 2. Aggregate (Memory Processing)
+	report := h.aggregator.AggregateByRegion(transactions)
 
-	go func() {
-		defer wg.Done()
-		flights, err := h.flightSvc.FindFlights(reqData.Destination)
-		mu.Lock()
-		defer mu.Unlock()
-		if err != nil {
-			response.Errors = append(response.Errors, fmt.Sprintf("Penerbangan: %v", err))
-		} else {
-			response.Flights = flights
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		hotels, err := h.hotelSvc.FindHotels(reqData.Destination)
-		mu.Lock()
-		defer mu.Unlock()
-		if err != nil {
-			response.Errors = append(response.Errors, fmt.Sprintf("Hotel: %v", err))
-		} else {
-			response.Hotels = hotels
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		activities, err := h.activitySvc.FindActivities(reqData.Destination)
-		mu.Lock()
-		defer mu.Unlock()
-		if err != nil {
-			response.Errors = append(response.Errors, fmt.Sprintf("Aktivitas: %v", err))
-		} else {
-			response.Activities = activities
-		}
-	}()
-
-	// 2. Tunggu semua pencarian selesai
-	wg.Wait()
-
-	// 3. Kirim respons yang sudah diagregasi
+	// 3. Respond
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(report)
 }
 
 func main() {
-	handler := NewItineraryHandler(
-		&LiveFlightFinder{},
-		&LiveHotelFinder{},
-		&LiveActivityFinder{},
+	handler := NewReportHandler(
+		&LiveTransactionFetcher{},
+		&LiveReportAggregator{},
 	)
 	mux := http.NewServeMux()
-	mux.Handle("/generate-itinerary", handler)
+	mux.Handle("/generate-sales-report", handler)
 
-	log.Println("Server agregator perjalanan berjalan di http://localhost:8080")
+	log.Println("Server pelaporan penjualan berjalan di http://localhost:8080")
 	http.ListenAndServe(":8080", mux)
 }
