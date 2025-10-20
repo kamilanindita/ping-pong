@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/gorilla/mux"
@@ -34,7 +33,7 @@ func main() {
 		log.Fatal("DATABASE_URL tidak disetel")
 	}
 
-	runMigrations(connStr)
+	// runMigrations(connStr) // Proses migrasi dinonaktifkan seperti yang diminta
 	initDB(connStr)
 	defer db.Close()
 
@@ -48,22 +47,22 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
-func runMigrations(databaseURL string) {
-	log.Println("Menjalankan migrasi database...")
-	// Path ke file migrasi di dalam kontainer Docker
-	migrationsPath := "file://db/migration"
+// func runMigrations(databaseURL string) {
+// 	log.Println("Menjalankan migrasi database...")
+// 	// Path ke file migrasi di dalam kontainer Docker
+// 	migrationsPath := "file://db/migration"
 
-	m, err := migrate.New(migrationsPath, databaseURL)
-	if err != nil {
-		log.Fatalf("Gagal membuat instance migrasi: %v", err)
-	}
+// 	m, err := migrate.New(migrationsPath, databaseURL)
+// 	if err != nil {
+// 		log.Fatalf("Gagal membuat instance migrasi: %v", err)
+// 	}
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		log.Fatalf("Gagal menjalankan migrasi 'up': %v", err)
-	}
+// 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+// 		log.Fatalf("Gagal menjalankan migrasi 'up': %v", err)
+// 	}
 
-	log.Println("Migrasi database berhasil dijalankan.")
-}
+// 	log.Println("Migrasi database berhasil dijalankan.")
+// }
 
 func initDB(connStr string) {
 	var err error
