@@ -3,128 +3,165 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
-// --- Interfaces mendefinisikan KONTRAK untuk dependensi eksternal ---
-
-type InventoryChecker interface {
-	CheckStock(productID string, quantity int) error
+// --- Tipe Data untuk Hasil ---
+type FlightDeal struct {
+	Airline string  `json:"airline"`
+	Price   float64 `json:"price"`
 }
 
-type PaymentProcessor interface {
-	ProcessPayment(userID string, amount float64) (string, error) // Returns transactionID or error
+type HotelDeal struct {
+	HotelName string  `json:"hotel_name"`
+	Price     float64 `json:"price_per_night"`
 }
 
-type Notifier interface {
-	SendOrderConfirmation(userID string, orderDetails map[string]interface{}) error
+type ActivityDeal struct {
+	Name        string  `json:"name"`
+	Price       float64 `json:"price_per_person"`
+	Description string  `json:"description"`
 }
 
-// --- Implementasi NYATA (yang akan digunakan di produksi) ---
-
-type LiveInventoryService struct {
-	// Di dunia nyata, ini akan memiliki URL, http.Client, dll.
+// --- Interfaces untuk Dependensi Eksternal ---
+type FlightFinder interface {
+	FindFlights(destination string) ([]FlightDeal, error)
+}
+type HotelFinder interface {
+	FindHotels(destination string) ([]HotelDeal, error)
+}
+type ActivityFinder interface {
+	FindActivities(destination string) ([]ActivityDeal, error)
 }
 
-func (s *LiveInventoryService) CheckStock(productID string, quantity int) error {
-	log.Printf("NYATA: Menghubungi Layanan Inventaris untuk produk %s...", productID)
-	// Logika panggilan HTTP ke layanan inventaris...
-	if productID == "OUTOFSTOCK" {
-		return errors.New("stok produk tidak mencukupi")
+// --- Implementasi NYATA (untuk produksi) ---
+type LiveFlightFinder struct{}
+
+func (f *LiveFlightFinder) FindFlights(destination string) ([]FlightDeal, error) {
+	log.Println("NYATA: Mencari penerbangan...")
+	time.Sleep(150 * time.Millisecond) // Simulasikan latensi jaringan
+	if destination == "Tokyo" {
+		return []FlightDeal{{Airline: "JAL", Price: 1200.50}, {Airline: "ANA", Price: 1250.00}}, nil
 	}
-	return nil
-}
-
-type LivePaymentGateway struct{}
-
-func (g *LivePaymentGateway) ProcessPayment(userID string, amount float64) (string, error) {
-	log.Printf("NYATA: Memproses pembayaran sebesar %.2f untuk pengguna %s...", amount, userID)
-	// Logika panggilan HTTP ke gateway pembayaran...
-	if amount > 1000 {
-		return "", errors.New("pembayaran ditolak oleh bank")
+	if destination == "Bali" {
+		return nil, errors.New("tidak ada penerbangan tersedia untuk Bali")
 	}
-	return fmt.Sprintf("txn_%d", time.Now().UnixNano()), nil
+	return []FlightDeal{{Airline: "Generic Air", Price: 800.00}}, nil
 }
 
-type LiveEmailNotifier struct{}
+type LiveHotelFinder struct{}
 
-func (n *LiveEmailNotifier) SendOrderConfirmation(userID string, orderDetails map[string]interface{}) error {
-	log.Printf("NYATA: Mengirim email konfirmasi ke %s...", userID)
-	// Logika panggilan HTTP ke layanan email...
-	return nil
-}
-
-// --- Handler Utama yang berisi Logika Alur Kerja ---
-
-type OrderHandler struct {
-	inventorySvc InventoryChecker
-	paymentSvc   PaymentProcessor
-	notifierSvc  Notifier
-}
-
-// NewOrderHandler adalah constructor yang menerima dependensi (Dependency Injection)
-func NewOrderHandler(inv InventoryChecker, pay PaymentProcessor, notif Notifier) *OrderHandler {
-	return &OrderHandler{
-		inventorySvc: inv,
-		paymentSvc:   pay,
-		notifierSvc:  notif,
+func (f *LiveHotelFinder) FindHotels(destination string) ([]HotelDeal, error) {
+	log.Println("NYATA: Mencari hotel...")
+	time.Sleep(200 * time.Millisecond) // Simulasikan latensi yang sedikit lebih lama
+	if destination == "Paris" {
+		return []HotelDeal{{HotelName: "Ritz", Price: 990.00}}, nil
 	}
+	return []HotelDeal{{HotelName: "Grand Hyatt", Price: 350.75}}, nil
 }
 
-func (h *OrderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var orderData map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&orderData); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+type LiveActivityFinder struct{}
+
+func (f *LiveActivityFinder) FindActivities(destination string) ([]ActivityDeal, error) {
+	log.Println("NYATA: Mencari aktivitas...")
+	time.Sleep(100 * time.Millisecond)
+	if destination == "Paris" {
+		return nil, errors.New("layanan aktivitas sedang down")
+	}
+	return []ActivityDeal{{Name: "City Tour", Price: 75.00, Description: "Jelajahi kota"}}, nil
+}
+
+// --- Handler Utama yang Mengatur Alur Kerja ---
+type ItineraryHandler struct {
+	flightSvc   FlightFinder
+	hotelSvc    HotelFinder
+	activitySvc ActivityFinder
+}
+
+func NewItineraryHandler(f FlightFinder, h HotelFinder, a ActivityFinder) *ItineraryHandler {
+	return &ItineraryHandler{f, h, a}
+}
+
+type ItineraryResponse struct {
+	Flights    []FlightDeal   `json:"flights,omitempty"`
+	Hotels     []HotelDeal    `json:"hotels,omitempty"`
+	Activities []ActivityDeal `json:"activities,omitempty"`
+	Errors     []string       `json:"errors,omitempty"`
+}
+
+func (h *ItineraryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var reqData struct {
+		Destination string `json:"destination"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	productID := orderData["product_id"].(string)
-	quantity := int(orderData["quantity"].(float64))
-	amount := orderData["amount"].(float64)
-	userID := orderData["user_id"].(string)
+	response := ItineraryResponse{}
+	var wg sync.WaitGroup
+	var mu sync.Mutex // Untuk melindungi akses ke 'response'
 
-	// Langkah 1: Cek Stok
-	if err := h.inventorySvc.CheckStock(productID, quantity); err != nil {
-		http.Error(w, fmt.Sprintf("Gagal memeriksa stok: %v", err), http.StatusConflict) // 409 Conflict
-		return
-	}
+	// 1. Jalankan semua pencarian secara paralel
+	wg.Add(3)
 
-	// Langkah 2: Proses Pembayaran
-	transactionID, err := h.paymentSvc.ProcessPayment(userID, amount)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Gagal memproses pembayaran: %v", err), http.StatusPaymentRequired) // 402 Payment Required
-		return
-	}
+	go func() {
+		defer wg.Done()
+		flights, err := h.flightSvc.FindFlights(reqData.Destination)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("Penerbangan: %v", err))
+		} else {
+			response.Flights = flights
+		}
+	}()
 
-	// Langkah 3: Kirim Notifikasi
-	if err := h.notifierSvc.SendOrderConfirmation(userID, orderData); err != nil {
-		// Biasanya ini tidak menggagalkan seluruh transaksi, hanya dicatat.
-		log.Printf("PERINGATAN: Gagal mengirim notifikasi untuk transaksi %s: %v", transactionID, err)
-	}
+	go func() {
+		defer wg.Done()
+		hotels, err := h.hotelSvc.FindHotels(reqData.Destination)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("Hotel: %v", err))
+		} else {
+			response.Hotels = hotels
+		}
+	}()
 
-	// Respon sukses
+	go func() {
+		defer wg.Done()
+		activities, err := h.activitySvc.FindActivities(reqData.Destination)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("Aktivitas: %v", err))
+		} else {
+			response.Activities = activities
+		}
+	}()
+
+	// 2. Tunggu semua pencarian selesai
+	wg.Wait()
+
+	// 3. Kirim respons yang sudah diagregasi
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated) // 201 Created
-	json.NewEncoder(w).Encode(map[string]string{
-		"message":        "Pesanan berhasil dibuat",
-		"transaction_id": transactionID,
-	})
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	// --- Wiring Dependensi NYATA di sini ---
-	inventory := &LiveInventoryService{}
-	payment := &LivePaymentGateway{}
-	notifier := &LiveEmailNotifier{}
-
-	orderHandler := NewOrderHandler(inventory, payment, notifier)
-
+	handler := NewItineraryHandler(
+		&LiveFlightFinder{},
+		&LiveHotelFinder{},
+		&LiveActivityFinder{},
+	)
 	mux := http.NewServeMux()
-	mux.Handle("/orders", orderHandler)
+	mux.Handle("/generate-itinerary", handler)
 
-	log.Println("Server berjalan di http://localhost:8080")
+	log.Println("Server agregator perjalanan berjalan di http://localhost:8080")
 	http.ListenAndServe(":8080", mux)
 }
+
