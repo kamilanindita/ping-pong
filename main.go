@@ -107,7 +107,7 @@ func handleGetProducts(w http.ResponseWriter, r *http.Request, cacheKey string, 
 }
 
 func fetchProductsFromDB() ([]Product, error) {
-	sqlStatement := `SELECT id, name, price, stock FROM products`
+	sqlStatement := `SELECT id, name, price, stock FROM products limit 50`
 	rows, err := db.Query(sqlStatement)
 	if err != nil {
 		return nil, errors.New("gagal mengambil daftar produk")
