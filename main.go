@@ -3,9 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json" // Library standar
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,20 +12,23 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
+
+	jsoniter "github.com/json-iterator/go" // Library alternatif yang cepat
 )
 
 var (
-	db  *sql.DB
-	rdb *redis.Client
-	ctx = context.Background()
+	db    *sql.DB
+	rdb   *redis.Client
+	ctx   = context.Background()
+	jsoni = jsoniter.ConfigCompatibleWithStandardLibrary // Instance Json-Iterator
 )
 
-const cacheKeyProducts = "products"
+const (
+	cacheKeyStandard = "products_standard"
+	cacheKeyIterator = "products_iterator"
+)
 
 type Product struct {
 	ID    int     `json:"id"`
@@ -47,12 +49,13 @@ func main() {
 	initRedis(redisURL)
 	defer db.Close()
 
-	// (Opsional) Mengaktifkan kembali migrasi jika diperlukan
-	// runMigrations(dbConnStr)
-
 	r := mux.NewRouter()
+	// Endpoint untuk perbandingan
+	r.HandleFunc("/products-standard", getProductsStandardHandler).Methods("GET")
+	r.HandleFunc("/products-iterator", getProductsIteratorHandler).Methods("GET")
+
+	// Endpoint lain (menggunakan jsoniter untuk konsistensi)
 	r.HandleFunc("/products", createProductHandler).Methods("POST")
-	r.HandleFunc("/products", getProductsHandler).Methods("GET")
 	r.HandleFunc("/products/{id}", getProductHandler).Methods("GET")
 	r.HandleFunc("/products/{id}/stock", updateStockHandler).Methods("PUT")
 
@@ -60,69 +63,41 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
-func initRedis(redisURL string) {
-	rdb = redis.NewClient(&redis.Options{
-		Addr: redisURL,
-	})
-
-	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		log.Fatalf("Tidak dapat terhubung ke Redis: %v", err)
-	}
-	log.Println("Berhasil terhubung ke Redis.")
+// Handler yang menggunakan encoding/json standar
+func getProductsStandardHandler(w http.ResponseWriter, r *http.Request) {
+	handleGetProducts(w, r, cacheKeyStandard, json.Marshal)
 }
 
-// Handler GET /products sekarang dengan logika caching
-func getProductsHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Coba ambil dari Cache terlebih dahulu
-	cachedProducts, err := rdb.Get(ctx, cacheKeyProducts).Result()
+// Handler yang menggunakan json-iterator/go
+func getProductsIteratorHandler(w http.ResponseWriter, r *http.Request) {
+	handleGetProducts(w, r, cacheKeyIterator, jsoni.Marshal)
+}
+
+// Fungsi generik untuk logika get products dengan marshaller yang bisa diganti
+func handleGetProducts(w http.ResponseWriter, r *http.Request, cacheKey string, marshaller func(v interface{}) ([]byte, error)) {
+	cachedProducts, err := rdb.Get(ctx, cacheKey).Result()
 	if err == nil {
-		// Cache HIT
-		log.Println("CACHE HIT: Mengambil produk dari Redis.")
+		log.Printf("CACHE HIT: Mengambil dari Redis untuk kunci %s.", cacheKey)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(cachedProducts))
 		return
 	}
 
-	if err != redis.Nil {
-		log.Printf("Error mengambil dari Redis: %v", err)
-	}
-
-	// 2. Jika Cache MISS, ambil dari Database
-	log.Println("CACHE MISS: Mengambil produk dari PostgreSQL.")
-	sqlStatement := `SELECT id, name, price, stock FROM products`
-	rows, err := db.Query(sqlStatement)
+	log.Printf("CACHE MISS: Mengambil dari PostgreSQL untuk kunci %s.", cacheKey)
+	products, err := fetchProductsFromDB()
 	if err != nil {
-		http.Error(w, "Gagal mengambil daftar produk", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var products []Product
-	for rows.Next() {
-		var p Product
-		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
-			http.Error(w, "Gagal memindai data produk", http.StatusInternalServerError)
-			return
-		}
-		products = append(products, p)
-	}
-	if err = rows.Err(); err != nil {
-		http.Error(w, "Error saat iterasi produk", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if products == nil {
-		products = make([]Product, 0)
-	}
-
-	// 3. Simpan hasil dari database ke Cache untuk permintaan berikutnya
-	jsonData, err := json.Marshal(products)
+	// Gunakan marshaller yang diberikan (bisa json.Marshal atau jsoni.Marshal)
+	jsonData, err := marshaller(products)
 	if err != nil {
 		http.Error(w, "Gagal mem-format data untuk cache", http.StatusInternalServerError)
 		return
 	}
-	// Tetapkan cache dengan masa berlaku (misalnya, 10 menit)
-	err = rdb.Set(ctx, cacheKeyProducts, jsonData, 10*time.Minute).Err()
+
+	err = rdb.Set(ctx, cacheKey, jsonData, 10*time.Minute).Err()
 	if err != nil {
 		log.Printf("Gagal menyimpan ke Redis: %v", err)
 	}
@@ -131,36 +106,56 @@ func getProductsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonData)
 }
 
-// createProductHandler sekarang menghapus cache
+func fetchProductsFromDB() ([]Product, error) {
+	sqlStatement := `SELECT id, name, price, stock FROM products`
+	rows, err := db.Query(sqlStatement)
+	if err != nil {
+		return nil, errors.New("gagal mengambil daftar produk")
+	}
+	defer rows.Close()
+
+	var products []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, errors.New("gagal memindai data produk")
+		}
+		products = append(products, p)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, errors.New("error saat iterasi produk")
+	}
+
+	if products == nil {
+		products = make([]Product, 0)
+	}
+	return products, nil
+}
+
+// Handler lain sekarang menggunakan jsoniter untuk efisiensi
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	var p Product
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := jsoni.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
 	sqlStatement := `INSERT INTO products (name, price, stock) VALUES ($1, $2, $3) RETURNING id`
 	err := db.QueryRow(sqlStatement, p.Name, p.Price, p.Stock).Scan(&p.ID)
 	if err != nil {
 		http.Error(w, "Gagal membuat produk", http.StatusInternalServerError)
-		log.Printf("Error QueryRow: %v", err)
 		return
 	}
-
-	// CACHE INVALIDATION: Hapus cache 'products'
-	log.Println("CACHE INVALIDATION: Menghapus kunci 'products'.")
-	rdb.Del(ctx, cacheKeyProducts)
-
+	// Invalidate kedua cache
+	rdb.Del(ctx, cacheKeyStandard, cacheKeyIterator)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(p)
+	jsoni.NewEncoder(w).Encode(p)
 }
 
-// updateStockHandler sekarang menghapus cache
+// Ditambahkan di sini agar file lengkap
 func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id, _ := strconv.Atoi(vars["id"])
-
 	var payload struct {
 		Stock int `json:"stock"`
 	}
@@ -168,32 +163,18 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
 	sqlStatement := `UPDATE products SET stock = $1 WHERE id = $2`
-	res, err := db.Exec(sqlStatement, payload.Stock, id)
+	_, err := db.Exec(sqlStatement, payload.Stock, id)
 	if err != nil {
 		http.Error(w, "Gagal memperbarui stok", http.StatusInternalServerError)
 		return
 	}
-
-	rowsAffected, _ := res.RowsAffected()
-	if rowsAffected == 0 {
-		http.NotFound(w, r)
-		return
-	}
-
-	// CACHE INVALIDATION: Hapus cache 'products'
-	log.Println("CACHE INVALIDATION: Menghapus kunci 'products'.")
-	rdb.Del(ctx, cacheKeyProducts)
-
+	// Invalidate kedua cache
+	rdb.Del(ctx, cacheKeyStandard, cacheKeyIterator)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "Stok berhasil diperbarui")
 }
 
-// Fungsi lainnya (getProductHandler untuk satu produk, initDB, dll. tetap sama)
-
 func getProductHandler(w http.ResponseWriter, r *http.Request) {
-	// Note: Caching untuk item tunggal bisa ditambahkan di sini dengan pola yang sama
 	vars := mux.Vars(r)
 	id, _ := strconv.Atoi(vars["id"])
 	var p Product
@@ -208,7 +189,7 @@ func getProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(p)
+	jsoni.NewEncoder(w).Encode(p)
 }
 
 func initDB(connStr string) {
@@ -229,20 +210,12 @@ func initDB(connStr string) {
 	log.Fatalf("Tidak dapat terhubung ke database setelah beberapa kali percobaan: %v", err)
 }
 
-// Fungsi ini sengaja ditinggalkan kosong karena dinonaktifkan di main()
-// Anda bisa mengaktifkannya kembali jika perlu
-func runMigrations(databaseURL string) {
-	log.Println("Menjalankan migrasi database...")
-	migrationsPath := "file://db/migration"
-
-	m, err := migrate.New(migrationsPath, databaseURL)
-	if err != nil {
-		log.Fatalf("Gagal membuat instance migrasi: %v", err)
+func initRedis(redisURL string) {
+	rdb = redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+	if _, err := rdb.Ping(ctx).Result(); err != nil {
+		log.Fatalf("Tidak dapat terhubung ke Redis: %v", err)
 	}
-
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		log.Fatalf("Gagal menjalankan migrasi 'up': %v", err)
-	}
-
-	log.Println("Migrasi database berhasil dijalankan.")
+	log.Println("Berhasil terhubung ke Redis.")
 }
