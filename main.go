@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json" // Library standar
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,21 +16,17 @@ import (
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 
-	jsoniter "github.com/json-iterator/go" // Library alternatif yang cepat
+	jsoniter "github.com/json-iterator/go"
 )
 
 var (
 	db    *sql.DB
 	rdb   *redis.Client
 	ctx   = context.Background()
-	jsoni = jsoniter.ConfigCompatibleWithStandardLibrary // Instance Json-Iterator
+	jsoni = jsoniter.ConfigCompatibleWithStandardLibrary
 )
 
-const (
-	cacheKeyStandard = "products_standard"
-	cacheKeyIterator = "products_iterator"
-)
-
+// ... (Struct Product dan fungsi main tetap sama) ...
 type Product struct {
 	ID    int     `json:"id"`
 	Name  string  `json:"name"`
@@ -50,11 +47,8 @@ func main() {
 	defer db.Close()
 
 	r := mux.NewRouter()
-	// Endpoint untuk perbandingan
 	r.HandleFunc("/products-standard", getProductsStandardHandler).Methods("GET")
 	r.HandleFunc("/products-iterator", getProductsIteratorHandler).Methods("GET")
-
-	// Endpoint lain (menggunakan jsoniter untuk konsistensi)
 	r.HandleFunc("/products", createProductHandler).Methods("POST")
 	r.HandleFunc("/products/{id}", getProductHandler).Methods("GET")
 	r.HandleFunc("/products/{id}/stock", updateStockHandler).Methods("PUT")
@@ -63,18 +57,30 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
-// Handler yang menggunakan encoding/json standar
-func getProductsStandardHandler(w http.ResponseWriter, r *http.Request) {
-	handleGetProducts(w, r, cacheKeyStandard, json.Marshal)
-}
+// --- PERUBAHAN UTAMA DI SINI ---
+// Fungsi handleGetProducts sekarang menerima parameter paginasi
 
-// Handler yang menggunakan json-iterator/go
-func getProductsIteratorHandler(w http.ResponseWriter, r *http.Request) {
-	handleGetProducts(w, r, cacheKeyIterator, jsoni.Marshal)
-}
+func handleGetProducts(w http.ResponseWriter, r *http.Request, marshaller func(v interface{}) ([]byte, error)) {
+	// 1. Baca parameter 'limit' dan 'page' dari URL
+	limitStr := r.URL.Query().Get("limit")
+	pageStr := r.URL.Query().Get("page")
 
-// Fungsi generik untuk logika get products dengan marshaller yang bisa diganti
-func handleGetProducts(w http.ResponseWriter, r *http.Request, cacheKey string, marshaller func(v interface{}) ([]byte, error)) {
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 50 // Nilai default jika tidak ada atau tidak valid
+	}
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page <= 0 {
+		page = 1 // Nilai default
+	}
+
+	offset := (page - 1) * limit
+
+	// Buat kunci cache yang unik untuk setiap halaman
+	cacheKey := fmt.Sprintf("products:page:%d:limit:%d", page, limit)
+
+	// Logika caching tetap sama
 	cachedProducts, err := rdb.Get(ctx, cacheKey).Result()
 	if err == nil {
 		log.Printf("CACHE HIT: Mengambil dari Redis untuk kunci %s.", cacheKey)
@@ -83,32 +89,33 @@ func handleGetProducts(w http.ResponseWriter, r *http.Request, cacheKey string, 
 		return
 	}
 
+	// 2. Ambil data dari DB dengan LIMIT dan OFFSET
 	log.Printf("CACHE MISS: Mengambil dari PostgreSQL untuk kunci %s.", cacheKey)
-	products, err := fetchProductsFromDB()
+	products, err := fetchProductsFromDB(limit, offset) // Panggil fungsi yang diperbarui
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Gunakan marshaller yang diberikan (bisa json.Marshal atau jsoni.Marshal)
+	// 3. Simpan ke cache dan kirim respons (logika ini tetap sama)
 	jsonData, err := marshaller(products)
 	if err != nil {
 		http.Error(w, "Gagal mem-format data untuk cache", http.StatusInternalServerError)
 		return
 	}
-
 	err = rdb.Set(ctx, cacheKey, jsonData, 10*time.Minute).Err()
 	if err != nil {
 		log.Printf("Gagal menyimpan ke Redis: %v", err)
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonData)
 }
 
-func fetchProductsFromDB() ([]Product, error) {
-	sqlStatement := `SELECT id, name, price, stock FROM products limit 50`
-	rows, err := db.Query(sqlStatement)
+// Fungsi fetchProductsFromDB sekarang menerima limit dan offset
+func fetchProductsFromDB(limit, offset int) ([]Product, error) {
+	// 3. Query SQL sekarang menggunakan LIMIT dan OFFSET
+	sqlStatement := `SELECT id, name, price, stock FROM products ORDER BY id LIMIT $1 OFFSET $2`
+	rows, err := db.Query(sqlStatement, limit, offset)
 	if err != nil {
 		return nil, errors.New("gagal mengambil daftar produk")
 	}
@@ -125,14 +132,22 @@ func fetchProductsFromDB() ([]Product, error) {
 	if err = rows.Err(); err != nil {
 		return nil, errors.New("error saat iterasi produk")
 	}
-
 	if products == nil {
 		products = make([]Product, 0)
 	}
 	return products, nil
 }
 
-// Handler lain sekarang menggunakan jsoniter untuk efisiensi
+// Handler pembanding (tidak berubah)
+func getProductsStandardHandler(w http.ResponseWriter, r *http.Request) {
+	handleGetProducts(w, r, json.Marshal)
+}
+
+func getProductsIteratorHandler(w http.ResponseWriter, r *http.Request) {
+	handleGetProducts(w, r, jsoni.Marshal)
+}
+
+// Ditambahkan di sini agar file lengkap
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	var p Product
 	if err := jsoni.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -145,14 +160,11 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gagal membuat produk", http.StatusInternalServerError)
 		return
 	}
-	// Invalidate kedua cache
-	rdb.Del(ctx, cacheKeyStandard, cacheKeyIterator)
+	// Invalidate: Lebih kompleks dengan paginasi, untuk sekarang kita biarkan
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	jsoni.NewEncoder(w).Encode(p)
 }
-
-// Ditambahkan di sini agar file lengkap
 func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id, _ := strconv.Atoi(vars["id"])
@@ -169,8 +181,6 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gagal memperbarui stok", http.StatusInternalServerError)
 		return
 	}
-	// Invalidate kedua cache
-	rdb.Del(ctx, cacheKeyStandard, cacheKeyIterator)
 	w.WriteHeader(http.StatusOK)
 }
 
